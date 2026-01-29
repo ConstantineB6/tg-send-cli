@@ -1,80 +1,62 @@
-# Telegram File Sender CLI
+# 📨 tg-send-cli
 
-## Description
+Send files to Telegram contacts from your CLI with a pretty TUI.
 
-This is a simple Command-Line Interface (CLI) utility for sending files to Telegram contacts. It uses Python and the Telethon library.
+[![PyPI](https://img.shields.io/pypi/v/tg-send-cli)](https://pypi.org/project/tg-send-cli/)
+[![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://python.org)
 
-## Prerequisites
+## Features
 
-- Python 3.x
-- pip
-- Telegram API ID and API Hash
-
-## Getting Telegram API ID and API Hash
-
-Before running the script, you need to get your Telegram API ID and API Hash. Follow these steps:
-
-Go to Telegram's developer website.
-Log in with your Telegram account.
-Create a new application.
-You will receive an API ID and an API Hash. Keep these handy; you'll need them to run the script.
-
+- **Pretty TUI** — Colors, progress bars, and unicode symbols
+- **Fuzzy search** — Find contacts by typing part of their name
+- **Easy install** — One command installation
 
 ## Installation
 
-### Step 1: Clone the Repository or Download the Script
-
-Clone this repository to your local machine:
-
 ```bash
-git clone https://github.com/KonstantinBelenko/cli-telegram-file-sender.git
+uv tool install tg-send-cli
 ```
 
-### Step 2: Install Dependencies
-
-Navigate to the directory where you cloned the repo or downloaded the script and run:
+Or with pip:
 
 ```bash
-pip install telethon
+pip install tg-send-cli
 ```
 
-### Step 3: Make Script Globally Accessible (Optional)
+## Setup
 
-To make the script globally accessible, you can move it to `/usr/local/bin` (Linux/Mac) or add it to your PATH environment variable (Windows).
+Before first use, you need Telegram API credentials:
 
-For Linux/Mac:
+1. Go to [my.telegram.org](https://my.telegram.org)
+2. Log in with your phone number
+3. Create a new application
+4. Copy your **API ID** and **API Hash**
 
-```bash
-sudo cp main.py /usr/local/bin/tsf
-sudo chmod +x /usr/local/bin/tsf
-```
-
-Now you can run `tsf` from anywhere in the terminal.
-
-For Windows, add the script directory to your PATH environment variable.
+The tool will prompt you for these on first run.
 
 ## Usage
 
-Run the script by passing in the path of the file you want to send:
-
 ```bash
-python main.py file_path
+tgsend photo.jpg        # Send a photo
+tgsend document.pdf     # Send a document
+tgsend video.mp4        # Send a video
 ```
 
-Or, if you made it globally accessible:
+### Contact Selection
 
-```bash
-tsf file_path
-```
+- **Type** to fuzzy search through contacts
+- **↑↓** to navigate
+- **Enter** to select
+- **Esc** to cancel
 
-### First Time Usage
+### First Run
 
-The first time you run the script, it will ask for your phone number to authenticate you. After the first time, your session will be remembered.
+On first run, you'll be prompted to:
+1. Enter your Telegram API credentials
+2. Authenticate with your phone number
 
-## Contributing
-
-Feel free to fork, improve, and create a pull request.
+Your session is saved locally at `~/.telegram_file_sender/`.
 
 ## License
 
-This project is open-source and available under the MIT License.
+MIT
