@@ -73,10 +73,51 @@ console = Console()
 SESSION_DIR = Path.home() / ".telegram_file_sender"
 SESSION_PATH = SESSION_DIR / "session_name"
 CONFIG_FILE = SESSION_DIR / "config"
+PINNED_FILE = SESSION_DIR / "pinned.json"
 
 
 def ensure_session_dir():
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# =============================================================================
+# Pinned contacts management
+# =============================================================================
+
+def load_pinned() -> set[int]:
+    """Load pinned contact IDs from file."""
+    if PINNED_FILE.exists():
+        try:
+            data = json.loads(PINNED_FILE.read_text())
+            return set(data.get("pinned", []))
+        except (json.JSONDecodeError, KeyError):
+            return set()
+    return set()
+
+
+def save_pinned(pinned: set[int]):
+    """Save pinned contact IDs to file."""
+    ensure_session_dir()
+    PINNED_FILE.write_text(json.dumps({"pinned": list(pinned)}, indent=2))
+
+
+def add_pinned(contact_id: int):
+    """Add a contact to pinned list."""
+    pinned = load_pinned()
+    pinned.add(contact_id)
+    save_pinned(pinned)
+
+
+def remove_pinned(contact_id: int):
+    """Remove a contact from pinned list."""
+    pinned = load_pinned()
+    pinned.discard(contact_id)
+    save_pinned(pinned)
+
+
+def is_pinned(contact_id: int) -> bool:
+    """Check if a contact is pinned."""
+    return contact_id in load_pinned()
 
 
 def get_credentials_or_none() -> tuple[int, str] | None:
@@ -183,8 +224,11 @@ def format_file_size(size_bytes: int) -> str:
         return f"{size_bytes} B"
 
 
-def build_contact_display(dialogs: list, filtered_indices: list[int], selected: int, query: str, cursor_pos: int, max_rows: int, term_width: int, file_name: str = "", file_size: int = 0) -> list:
+def build_contact_display(dialogs: list, filtered_indices: list[int], selected: int, query: str, cursor_pos: int, max_rows: int, term_width: int, file_name: str = "", file_size: int = 0, pinned_ids: set[int] = None) -> list:
     """Build the contact list display as prompt_toolkit formatted text."""
+    if pinned_ids is None:
+        pinned_ids = set()
+
     result = []
     pad = "  "
     content_width = term_width - 4  # Account for padding on both sides
@@ -255,8 +299,8 @@ def build_contact_display(dialogs: list, filtered_indices: list[int], selected: 
     if show_more:
         visible_count = max(1, visible_count - 1)
 
-    # Calculate name width: total - padding(4) - arrow(4) - type(12)
-    name_width = content_width - 16
+    # Calculate name width: total - padding(4) - arrow(4) - pin(3) - type(12)
+    name_width = content_width - 19
     type_col_width = 12
 
     if not filtered_indices:
@@ -270,18 +314,23 @@ def build_contact_display(dialogs: list, filtered_indices: list[int], selected: 
             idx = filtered_indices[i]
             dialog = dialogs[idx]
             name = (dialog.name or "(unnamed)")
+            is_contact_pinned = dialog.id in pinned_ids
 
             # Truncate and pad accounting for display width
             if get_display_width(name) > name_width:
                 name, _ = truncate_to_width(name, name_width)
             name_padded = pad_to_width(name, name_width)
             dtype = get_dialog_type(dialog)
+            pin_indicator = "📌 " if is_contact_pinned else "   "
 
             if i == selected:
-                line = f"{pad}  → {name_padded} {dtype}\n"
+                line = f"{pad}  → {pin_indicator}{name_padded} {dtype}\n"
                 result.append(("class:selected", line))
             else:
-                result.append(("class:item", f"{pad}    {name_padded} "))
+                if is_contact_pinned:
+                    result.append(("class:pinned", f"{pad}    {pin_indicator}{name_padded} "))
+                else:
+                    result.append(("class:item", f"{pad}    {pin_indicator}{name_padded} "))
                 result.append(("class:dim", f"{dtype}\n"))
 
         # Show "more" indicator
@@ -290,9 +339,21 @@ def build_contact_display(dialogs: list, filtered_indices: list[int], selected: 
             result.append(("class:more", f"{pad}    ↓ {remaining} more contact{'s' if remaining != 1 else ''}...\n"))
 
     result.append(("", "\n"))
-    result.append(("class:hint", f"{pad}↑↓ navigate  •  enter select  •  esc cancel"))
+    result.append(("class:hint", f"{pad}↑↓ navigate  •  enter select  •  ^P pin/unpin  •  esc cancel"))
 
     return result
+
+
+def sort_dialogs_with_pinned(dialogs: list, pinned_ids: set[int]) -> list[int]:
+    """Return indices sorted with pinned contacts first, then by original order."""
+    pinned_indices = []
+    unpinned_indices = []
+    for i, dialog in enumerate(dialogs):
+        if dialog.id in pinned_ids:
+            pinned_indices.append(i)
+        else:
+            unpinned_indices.append(i)
+    return pinned_indices + unpinned_indices
 
 
 def select_contact_sync(dialogs: list, file_name: str = "", file_size: int = 0) -> int | None:
@@ -301,17 +362,27 @@ def select_contact_sync(dialogs: list, file_name: str = "", file_size: int = 0) 
     max_rows = term_size.lines
     term_width = term_size.columns
 
+    pinned_ids = load_pinned()
+
     state = {
         "query": "",
         "cursor_pos": 0,
         "selected": 0,
-        "filtered_indices": list(range(len(dialogs))),
+        "filtered_indices": sort_dialogs_with_pinned(dialogs, pinned_ids),
         "result": None,
         "cancelled": False,
+        "pinned_ids": pinned_ids,
     }
 
     def update_filter():
-        state["filtered_indices"] = [idx for idx, _ in fuzzy_search(dialogs, state["query"])]
+        if state["query"]:
+            # When searching, sort by match score but keep pinned at top within results
+            search_results = fuzzy_search(dialogs, state["query"])
+            pinned_results = [(idx, score) for idx, score in search_results if dialogs[idx].id in state["pinned_ids"]]
+            unpinned_results = [(idx, score) for idx, score in search_results if dialogs[idx].id not in state["pinned_ids"]]
+            state["filtered_indices"] = [idx for idx, _ in pinned_results] + [idx for idx, _ in unpinned_results]
+        else:
+            state["filtered_indices"] = sort_dialogs_with_pinned(dialogs, state["pinned_ids"])
         if state["selected"] >= len(state["filtered_indices"]):
             state["selected"] = max(0, len(state["filtered_indices"]) - 1)
 
@@ -327,7 +398,8 @@ def select_contact_sync(dialogs: list, file_name: str = "", file_size: int = 0) 
             size.lines,
             size.columns,
             file_name,
-            file_size
+            file_size,
+            state["pinned_ids"]
         )
 
     kb = KeyBindings()
@@ -409,6 +481,19 @@ def select_contact_sync(dialogs: list, file_name: str = "", file_size: int = 0) 
             state["cursor_pos"] = new_pos
             update_filter()
 
+    @kb.add(Keys.ControlP)
+    def toggle_pin(event):
+        if state["filtered_indices"]:
+            idx = state["filtered_indices"][state["selected"]]
+            dialog_id = dialogs[idx].id
+            if dialog_id in state["pinned_ids"]:
+                state["pinned_ids"].discard(dialog_id)
+                remove_pinned(dialog_id)
+            else:
+                state["pinned_ids"].add(dialog_id)
+                add_pinned(dialog_id)
+            update_filter()
+
     @kb.add(Keys.Any)
     def type_char(event):
         char = event.data
@@ -433,6 +518,7 @@ def select_contact_sync(dialogs: list, file_name: str = "", file_size: int = 0) 
         "more": "#00d7ff italic",
         "hint": "#555555",
         "file": "#ffffff bold",
+        "pinned": "#ffaa00",  # Orange/gold for pinned contacts
     })
 
     app = Application(
@@ -731,6 +817,7 @@ async def cmd_contacts(args):
             output_error("Not authenticated. Run 'tgsend auth' first.", "not_authorized")
 
         dialogs = await client.get_dialogs(limit=args.limit or 100)
+        pinned_ids = load_pinned()
 
         # Apply search filter if provided
         if args.search:
@@ -739,12 +826,17 @@ async def cmd_contacts(args):
         else:
             filtered_dialogs = [(d, 100) for d in dialogs]
 
+        # Filter to pinned only if requested
+        if args.pinned_only:
+            filtered_dialogs = [(d, score) for d, score in filtered_dialogs if d.id in pinned_ids]
+
         contacts = []
         for dialog, score in filtered_dialogs:
             contact = {
                 "id": dialog.id,
                 "name": dialog.name,
                 "type": get_dialog_type_simple(dialog),
+                "pinned": dialog.id in pinned_ids,
             }
             if args.search:
                 contact["match_score"] = score
@@ -877,13 +969,186 @@ async def cmd_status(args):
         await client.disconnect()
 
 
+async def cmd_pin(args):
+    """Pin a contact."""
+    ensure_session_dir()
+
+    creds = get_credentials_or_none()
+    if not creds:
+        output_error("No API credentials configured.", "no_credentials")
+
+    api_id, api_hash = creds
+    client = TelegramClient(str(SESSION_PATH), api_id, api_hash)
+
+    try:
+        await client.connect()
+
+        if not await client.is_user_authorized():
+            output_error("Not authenticated. Run 'tgsend auth' first.", "not_authorized")
+
+        # Find contact by name or ID
+        if args.contact_id:
+            try:
+                entity = await client.get_entity(args.contact_id)
+                add_pinned(entity.id)
+                output_json({
+                    "success": True,
+                    "message": "Contact pinned",
+                    "contact": {
+                        "id": entity.id,
+                        "name": getattr(entity, 'first_name', None) or getattr(entity, 'title', None) or str(entity.id)
+                    }
+                })
+            except Exception as e:
+                output_error(f"Could not find entity with ID {args.contact_id}: {e}", "entity_not_found")
+        elif args.contact:
+            dialogs = await client.get_dialogs(limit=100)
+            search_results = fuzzy_search(dialogs, args.contact)
+            if not search_results:
+                output_error(f"No contact found matching '{args.contact}'", "contact_not_found")
+
+            best_match_idx, score = search_results[0]
+            if score < 60:
+                output_error(f"No good match found for '{args.contact}'. Best match: '{dialogs[best_match_idx].name}' (score: {score})", "low_match_score")
+
+            dialog = dialogs[best_match_idx]
+            add_pinned(dialog.id)
+            output_json({
+                "success": True,
+                "message": "Contact pinned",
+                "contact": {
+                    "id": dialog.id,
+                    "name": dialog.name
+                }
+            })
+        else:
+            output_error("Specify contact with name or --id", "no_contact")
+
+    finally:
+        await client.disconnect()
+
+
+async def cmd_unpin(args):
+    """Unpin a contact."""
+    ensure_session_dir()
+
+    creds = get_credentials_or_none()
+    if not creds:
+        output_error("No API credentials configured.", "no_credentials")
+
+    api_id, api_hash = creds
+    client = TelegramClient(str(SESSION_PATH), api_id, api_hash)
+
+    try:
+        await client.connect()
+
+        if not await client.is_user_authorized():
+            output_error("Not authenticated. Run 'tgsend auth' first.", "not_authorized")
+
+        # Find contact by name or ID
+        if args.contact_id:
+            remove_pinned(args.contact_id)
+            output_json({
+                "success": True,
+                "message": "Contact unpinned",
+                "contact_id": args.contact_id
+            })
+        elif args.contact:
+            dialogs = await client.get_dialogs(limit=100)
+            search_results = fuzzy_search(dialogs, args.contact)
+            if not search_results:
+                output_error(f"No contact found matching '{args.contact}'", "contact_not_found")
+
+            best_match_idx, score = search_results[0]
+            if score < 60:
+                output_error(f"No good match found for '{args.contact}'. Best match: '{dialogs[best_match_idx].name}' (score: {score})", "low_match_score")
+
+            dialog = dialogs[best_match_idx]
+            remove_pinned(dialog.id)
+            output_json({
+                "success": True,
+                "message": "Contact unpinned",
+                "contact": {
+                    "id": dialog.id,
+                    "name": dialog.name
+                }
+            })
+        else:
+            output_error("Specify contact with name or --id", "no_contact")
+
+    finally:
+        await client.disconnect()
+
+
+async def cmd_pinned(args):
+    """List pinned contacts."""
+    ensure_session_dir()
+
+    pinned_ids = load_pinned()
+
+    if not pinned_ids:
+        output_json({
+            "success": True,
+            "count": 0,
+            "contacts": [],
+            "message": "No pinned contacts"
+        })
+        return
+
+    creds = get_credentials_or_none()
+    if not creds:
+        # Return just the IDs if not authenticated
+        output_json({
+            "success": True,
+            "count": len(pinned_ids),
+            "contact_ids": list(pinned_ids),
+            "message": "Not authenticated - showing IDs only"
+        })
+        return
+
+    api_id, api_hash = creds
+    client = TelegramClient(str(SESSION_PATH), api_id, api_hash)
+
+    try:
+        await client.connect()
+
+        if not await client.is_user_authorized():
+            output_json({
+                "success": True,
+                "count": len(pinned_ids),
+                "contact_ids": list(pinned_ids),
+                "message": "Not authenticated - showing IDs only"
+            })
+            return
+
+        dialogs = await client.get_dialogs(limit=200)
+
+        contacts = []
+        for dialog in dialogs:
+            if dialog.id in pinned_ids:
+                contacts.append({
+                    "id": dialog.id,
+                    "name": dialog.name,
+                    "type": get_dialog_type_simple(dialog),
+                })
+
+        output_json({
+            "success": True,
+            "count": len(contacts),
+            "contacts": contacts
+        })
+
+    finally:
+        await client.disconnect()
+
+
 # =============================================================================
 # CLI entry point
 # =============================================================================
 
 def cli():
     # Check if first arg looks like a file path (not a subcommand)
-    subcommands = {"config", "status", "auth", "contacts", "send", "-h", "--help"}
+    subcommands = {"config", "status", "auth", "contacts", "send", "pin", "unpin", "pinned", "-h", "--help"}
 
     if len(sys.argv) >= 2 and sys.argv[1] not in subcommands:
         # Treat as file path - interactive mode
@@ -900,6 +1165,7 @@ def cli():
         epilog="""
 Interactive mode:
   tgsend photo.jpg              Open TUI to select contact and send
+                                (press Ctrl+P to pin/unpin contacts)
 
 LLM-friendly commands (JSON output):
   tgsend config --api-id ID --api-hash HASH   Configure credentials
@@ -910,6 +1176,9 @@ LLM-friendly commands (JSON output):
   tgsend contacts --search "john"             Search contacts
   tgsend send file.jpg --to "John"            Send file by name
   tgsend send file.jpg --to-id 123456789      Send file by ID
+  tgsend pin "John"                           Pin a contact
+  tgsend unpin "John"                         Unpin a contact
+  tgsend pinned                               List pinned contacts
         """
     )
 
@@ -934,12 +1203,26 @@ LLM-friendly commands (JSON output):
     contacts_parser = subparsers.add_parser("contacts", help="List or search contacts")
     contacts_parser.add_argument("--search", "-s", help="Fuzzy search query")
     contacts_parser.add_argument("--limit", "-l", type=int, default=100, help="Max contacts to fetch")
+    contacts_parser.add_argument("--pinned-only", "-p", action="store_true", help="Show only pinned contacts")
 
     # Send command
     send_parser = subparsers.add_parser("send", help="Send file (non-interactive)")
     send_parser.add_argument("file", help="Path to file to send")
     send_parser.add_argument("--to", help="Recipient name (fuzzy matched)")
     send_parser.add_argument("--to-id", type=int, help="Recipient Telegram ID")
+
+    # Pin command
+    pin_parser = subparsers.add_parser("pin", help="Pin a contact")
+    pin_parser.add_argument("contact", nargs="?", help="Contact name (fuzzy matched)")
+    pin_parser.add_argument("--id", dest="contact_id", type=int, help="Contact Telegram ID")
+
+    # Unpin command
+    unpin_parser = subparsers.add_parser("unpin", help="Unpin a contact")
+    unpin_parser.add_argument("contact", nargs="?", help="Contact name (fuzzy matched)")
+    unpin_parser.add_argument("--id", dest="contact_id", type=int, help="Contact Telegram ID")
+
+    # Pinned command
+    subparsers.add_parser("pinned", help="List pinned contacts")
 
     args = parser.parse_args()
 
@@ -954,6 +1237,12 @@ LLM-friendly commands (JSON output):
         asyncio.run(cmd_contacts(args))
     elif args.command == "send":
         asyncio.run(cmd_send(args))
+    elif args.command == "pin":
+        asyncio.run(cmd_pin(args))
+    elif args.command == "unpin":
+        asyncio.run(cmd_unpin(args))
+    elif args.command == "pinned":
+        asyncio.run(cmd_pinned(args))
     else:
         parser.print_help()
 
