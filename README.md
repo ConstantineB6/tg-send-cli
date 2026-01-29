@@ -9,6 +9,7 @@ Send files to Telegram contacts from your CLI with a pretty TUI.
 
 - **Pretty TUI** — Colors, progress bars, and unicode symbols
 - **Fuzzy search** — Find contacts by typing part of their name
+- **Pinned contacts** — Pin frequently used contacts to the top
 - **Easy install** — One command installation
 - **LLM-friendly** — JSON output commands for automation
 
@@ -49,6 +50,7 @@ tgsend video.mp4        # Send a video
 - **Type** to fuzzy search through contacts
 - **↑↓** to navigate
 - **Enter** to select
+- **Ctrl+P** to pin/unpin selected contact
 - **Esc** to cancel
 
 ### LLM-Friendly Commands (JSON Output)
@@ -103,6 +105,22 @@ tgsend send photo.jpg --to "John Doe"
 
 # By Telegram ID
 tgsend send photo.jpg --to-id 123456789
+```
+
+#### Pinned contacts
+
+```bash
+# Pin a contact
+tgsend pin "John Doe"
+
+# Unpin a contact
+tgsend unpin "John Doe"
+
+# List pinned contacts
+tgsend pinned
+
+# List only pinned contacts
+tgsend contacts --pinned-only
 ```
 
 ## Session Storage
