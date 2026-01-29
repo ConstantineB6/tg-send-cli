@@ -3,11 +3,13 @@
 
 import asyncio
 import argparse
+import json
 import shutil
 import sys
 from pathlib import Path
 
 from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -65,6 +67,7 @@ def pad_to_width(s: str, target_width: int) -> str:
     padding_needed = target_width - current_width
     return s + ' ' * max(0, padding_needed)
 
+
 console = Console()
 
 SESSION_DIR = Path.home() / ".telegram_file_sender"
@@ -76,12 +79,20 @@ def ensure_session_dir():
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def get_credentials() -> tuple[int, str]:
-    """Get API credentials from config file or prompt user."""
+def get_credentials_or_none() -> tuple[int, str] | None:
+    """Get API credentials from config file, returns None if not configured."""
     if CONFIG_FILE.exists():
         lines = CONFIG_FILE.read_text().strip().split('\n')
         if len(lines) >= 2:
             return int(lines[0]), lines[1]
+    return None
+
+
+def get_credentials() -> tuple[int, str]:
+    """Get API credentials from config file or prompt user."""
+    creds = get_credentials_or_none()
+    if creds:
+        return creds
 
     console.print(Panel(
         "[bold yellow]First-time setup[/bold yellow]\n\n"
@@ -106,6 +117,12 @@ def get_credentials() -> tuple[int, str]:
     return api_id_int, api_hash
 
 
+def save_credentials(api_id: int, api_hash: str):
+    """Save API credentials to config file."""
+    ensure_session_dir()
+    CONFIG_FILE.write_text(f"{api_id}\n{api_hash}\n")
+
+
 def print_header():
     console.print(Panel.fit(
         "[bold cyan]📨 Telegram File Sender[/bold cyan]",
@@ -124,6 +141,18 @@ def get_dialog_type(dialog) -> str:
         return "📢 Channel"
     else:
         return "💬 Chat"
+
+
+def get_dialog_type_simple(dialog) -> str:
+    """Return simple type string for JSON output."""
+    if dialog.is_user:
+        return "user"
+    elif dialog.is_group:
+        return "group"
+    elif dialog.is_channel:
+        return "channel"
+    else:
+        return "chat"
 
 
 def fuzzy_search(dialogs: list, query: str) -> list[tuple[int, int]]:
@@ -459,7 +488,12 @@ async def send_file_with_progress(client: TelegramClient, target, file_path: Pat
     console.print(f"\n[bold green]✓[/bold green] File sent successfully!")
 
 
-async def main(file_path: str):
+# =============================================================================
+# Interactive TUI mode (default)
+# =============================================================================
+
+async def main_interactive(file_path: str):
+    """Interactive TUI mode for sending files."""
     ensure_session_dir()
 
     path = Path(file_path)
@@ -525,23 +559,403 @@ async def main(file_path: str):
         await client.disconnect()
 
 
+# =============================================================================
+# LLM-friendly CLI commands (non-interactive, JSON output)
+# =============================================================================
+
+def output_json(data: dict):
+    """Print JSON output."""
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def output_error(message: str, code: str = "error"):
+    """Print error as JSON and exit."""
+    output_json({"success": False, "error": code, "message": message})
+    sys.exit(1)
+
+
+async def cmd_config(args):
+    """Configure API credentials."""
+    ensure_session_dir()
+
+    if args.api_id and args.api_hash:
+        save_credentials(args.api_id, args.api_hash)
+        output_json({
+            "success": True,
+            "message": "Credentials saved"
+        })
+    else:
+        creds = get_credentials_or_none()
+        if creds:
+            output_json({
+                "success": True,
+                "configured": True,
+                "api_id": creds[0]
+            })
+        else:
+            output_json({
+                "success": True,
+                "configured": False,
+                "message": "No credentials configured. Use --api-id and --api-hash to configure."
+            })
+
+
+async def cmd_auth(args):
+    """Handle authentication flow."""
+    ensure_session_dir()
+
+    creds = get_credentials_or_none()
+    if not creds:
+        output_error("No API credentials configured. Run 'tgsend config --api-id ID --api-hash HASH' first.", "no_credentials")
+
+    api_id, api_hash = creds
+    client = TelegramClient(str(SESSION_PATH), api_id, api_hash)
+
+    try:
+        await client.connect()
+
+        # Check if already authorized
+        if await client.is_user_authorized():
+            me = await client.get_me()
+            output_json({
+                "success": True,
+                "status": "authorized",
+                "user": {
+                    "id": me.id,
+                    "first_name": me.first_name,
+                    "last_name": me.last_name,
+                    "username": me.username,
+                    "phone": me.phone
+                }
+            })
+            return
+
+        # Not authorized - need phone number
+        if not args.phone:
+            output_json({
+                "success": True,
+                "status": "need_phone",
+                "message": "Provide phone number with --phone"
+            })
+            return
+
+        # Send code request
+        if not args.code:
+            try:
+                result = await client.send_code_request(args.phone)
+                output_json({
+                    "success": True,
+                    "status": "code_sent",
+                    "phone_code_hash": result.phone_code_hash,
+                    "message": "Code sent to Telegram app. Provide code with --code"
+                })
+            except Exception as e:
+                output_error(str(e), "send_code_failed")
+            return
+
+        # Verify code
+        try:
+            # We need to send code request again to get the hash, or user provides it
+            if args.phone_code_hash:
+                phone_code_hash = args.phone_code_hash
+            else:
+                # Re-send to get hash (Telegram will use cached code)
+                result = await client.send_code_request(args.phone)
+                phone_code_hash = result.phone_code_hash
+
+            await client.sign_in(args.phone, args.code, phone_code_hash=phone_code_hash)
+
+            me = await client.get_me()
+            output_json({
+                "success": True,
+                "status": "authorized",
+                "user": {
+                    "id": me.id,
+                    "first_name": me.first_name,
+                    "last_name": me.last_name,
+                    "username": me.username,
+                    "phone": me.phone
+                }
+            })
+
+        except SessionPasswordNeededError:
+            if not args.password:
+                output_json({
+                    "success": True,
+                    "status": "need_password",
+                    "message": "2FA is enabled. Provide password with --password"
+                })
+                return
+
+            try:
+                await client.sign_in(password=args.password)
+                me = await client.get_me()
+                output_json({
+                    "success": True,
+                    "status": "authorized",
+                    "user": {
+                        "id": me.id,
+                        "first_name": me.first_name,
+                        "last_name": me.last_name,
+                        "username": me.username,
+                        "phone": me.phone
+                    }
+                })
+            except Exception as e:
+                output_error(str(e), "password_failed")
+
+        except PhoneCodeInvalidError:
+            output_error("Invalid code", "invalid_code")
+        except Exception as e:
+            output_error(str(e), "sign_in_failed")
+
+    finally:
+        await client.disconnect()
+
+
+async def cmd_contacts(args):
+    """List or search contacts."""
+    ensure_session_dir()
+
+    creds = get_credentials_or_none()
+    if not creds:
+        output_error("No API credentials configured.", "no_credentials")
+
+    api_id, api_hash = creds
+    client = TelegramClient(str(SESSION_PATH), api_id, api_hash)
+
+    try:
+        await client.connect()
+
+        if not await client.is_user_authorized():
+            output_error("Not authenticated. Run 'tgsend auth' first.", "not_authorized")
+
+        dialogs = await client.get_dialogs(limit=args.limit or 100)
+
+        # Apply search filter if provided
+        if args.search:
+            search_results = fuzzy_search(dialogs, args.search)
+            filtered_dialogs = [(dialogs[idx], score) for idx, score in search_results]
+        else:
+            filtered_dialogs = [(d, 100) for d in dialogs]
+
+        contacts = []
+        for dialog, score in filtered_dialogs:
+            contact = {
+                "id": dialog.id,
+                "name": dialog.name,
+                "type": get_dialog_type_simple(dialog),
+            }
+            if args.search:
+                contact["match_score"] = score
+            contacts.append(contact)
+
+        output_json({
+            "success": True,
+            "count": len(contacts),
+            "contacts": contacts
+        })
+
+    finally:
+        await client.disconnect()
+
+
+async def cmd_send(args):
+    """Send file to a contact (non-interactive)."""
+    ensure_session_dir()
+
+    path = Path(args.file)
+    if not path.exists():
+        output_error(f"File not found: {args.file}", "file_not_found")
+
+    if not path.is_file():
+        output_error(f"Not a file: {args.file}", "not_a_file")
+
+    creds = get_credentials_or_none()
+    if not creds:
+        output_error("No API credentials configured.", "no_credentials")
+
+    api_id, api_hash = creds
+    client = TelegramClient(str(SESSION_PATH), api_id, api_hash)
+
+    try:
+        await client.connect()
+
+        if not await client.is_user_authorized():
+            output_error("Not authenticated. Run 'tgsend auth' first.", "not_authorized")
+
+        # Find target
+        target = None
+
+        if args.to_id:
+            # Direct ID
+            try:
+                target = await client.get_entity(args.to_id)
+            except Exception as e:
+                output_error(f"Could not find entity with ID {args.to_id}: {e}", "entity_not_found")
+        elif args.to:
+            # Fuzzy search by name
+            dialogs = await client.get_dialogs(limit=100)
+            search_results = fuzzy_search(dialogs, args.to)
+            if not search_results:
+                output_error(f"No contact found matching '{args.to}'", "contact_not_found")
+
+            best_match_idx, score = search_results[0]
+            if score < 60:
+                output_error(f"No good match found for '{args.to}'. Best match: '{dialogs[best_match_idx].name}' (score: {score})", "low_match_score")
+
+            target = dialogs[best_match_idx]
+        else:
+            output_error("Specify recipient with --to (name) or --to-id (Telegram ID)", "no_recipient")
+
+        # Send file
+        file_size = path.stat().st_size
+
+        await client.send_file(target.id, str(path))
+
+        output_json({
+            "success": True,
+            "message": "File sent",
+            "file": {
+                "name": path.name,
+                "size": file_size,
+                "size_human": format_file_size(file_size)
+            },
+            "recipient": {
+                "id": target.id,
+                "name": getattr(target, 'name', None) or getattr(target, 'title', None) or str(target.id)
+            }
+        })
+
+    finally:
+        await client.disconnect()
+
+
+async def cmd_status(args):
+    """Check authentication status."""
+    ensure_session_dir()
+
+    creds = get_credentials_or_none()
+    if not creds:
+        output_json({
+            "success": True,
+            "configured": False,
+            "authenticated": False,
+            "message": "No API credentials configured"
+        })
+        return
+
+    api_id, api_hash = creds
+    client = TelegramClient(str(SESSION_PATH), api_id, api_hash)
+
+    try:
+        await client.connect()
+
+        if await client.is_user_authorized():
+            me = await client.get_me()
+            output_json({
+                "success": True,
+                "configured": True,
+                "authenticated": True,
+                "user": {
+                    "id": me.id,
+                    "first_name": me.first_name,
+                    "last_name": me.last_name,
+                    "username": me.username,
+                    "phone": me.phone
+                }
+            })
+        else:
+            output_json({
+                "success": True,
+                "configured": True,
+                "authenticated": False,
+                "message": "Credentials configured but not authenticated"
+            })
+
+    finally:
+        await client.disconnect()
+
+
+# =============================================================================
+# CLI entry point
+# =============================================================================
+
 def cli():
+    # Check if first arg looks like a file path (not a subcommand)
+    subcommands = {"config", "status", "auth", "contacts", "send", "-h", "--help"}
+
+    if len(sys.argv) >= 2 and sys.argv[1] not in subcommands:
+        # Treat as file path - interactive mode
+        if sys.argv[1].startswith("-"):
+            # It's a flag, show help
+            pass
+        else:
+            asyncio.run(main_interactive(sys.argv[1]))
+            return
+
     parser = argparse.ArgumentParser(
         description="📨 Send files to Telegram contacts",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  tsf photo.jpg          Send a photo
-  tsf document.pdf       Send a document
-  tsf video.mp4          Send a video
+Interactive mode:
+  tgsend photo.jpg              Open TUI to select contact and send
 
-First run will prompt for Telegram authentication.
+LLM-friendly commands (JSON output):
+  tgsend config --api-id ID --api-hash HASH   Configure credentials
+  tgsend status                               Check auth status
+  tgsend auth --phone +1234567890             Start authentication
+  tgsend auth --phone +1234567890 --code 12345   Complete authentication
+  tgsend contacts                             List contacts
+  tgsend contacts --search "john"             Search contacts
+  tgsend send file.jpg --to "John"            Send file by name
+  tgsend send file.jpg --to-id 123456789      Send file by ID
         """
     )
-    parser.add_argument("file_path", help="Path to the file to send")
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Config command
+    config_parser = subparsers.add_parser("config", help="Configure API credentials")
+    config_parser.add_argument("--api-id", type=int, help="Telegram API ID")
+    config_parser.add_argument("--api-hash", help="Telegram API Hash")
+
+    # Status command
+    subparsers.add_parser("status", help="Check authentication status")
+
+    # Auth command
+    auth_parser = subparsers.add_parser("auth", help="Authenticate with Telegram")
+    auth_parser.add_argument("--phone", help="Phone number with country code (e.g., +1234567890)")
+    auth_parser.add_argument("--code", help="Verification code from Telegram")
+    auth_parser.add_argument("--phone-code-hash", help="Phone code hash from code_sent response")
+    auth_parser.add_argument("--password", help="2FA password if enabled")
+
+    # Contacts command
+    contacts_parser = subparsers.add_parser("contacts", help="List or search contacts")
+    contacts_parser.add_argument("--search", "-s", help="Fuzzy search query")
+    contacts_parser.add_argument("--limit", "-l", type=int, default=100, help="Max contacts to fetch")
+
+    # Send command
+    send_parser = subparsers.add_parser("send", help="Send file (non-interactive)")
+    send_parser.add_argument("file", help="Path to file to send")
+    send_parser.add_argument("--to", help="Recipient name (fuzzy matched)")
+    send_parser.add_argument("--to-id", type=int, help="Recipient Telegram ID")
+
     args = parser.parse_args()
 
-    asyncio.run(main(args.file_path))
+    # Route to appropriate handler
+    if args.command == "config":
+        asyncio.run(cmd_config(args))
+    elif args.command == "status":
+        asyncio.run(cmd_status(args))
+    elif args.command == "auth":
+        asyncio.run(cmd_auth(args))
+    elif args.command == "contacts":
+        asyncio.run(cmd_contacts(args))
+    elif args.command == "send":
+        asyncio.run(cmd_send(args))
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":

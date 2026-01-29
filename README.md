@@ -10,6 +10,7 @@ Send files to Telegram contacts from your CLI with a pretty TUI.
 - **Pretty TUI** — Colors, progress bars, and unicode symbols
 - **Fuzzy search** — Find contacts by typing part of their name
 - **Easy install** — One command installation
+- **LLM-friendly** — JSON output commands for automation
 
 ## Installation
 
@@ -36,24 +37,75 @@ The tool will prompt you for these on first run.
 
 ## Usage
 
+### Interactive Mode (TUI)
+
 ```bash
 tgsend photo.jpg        # Send a photo
 tgsend document.pdf     # Send a document
 tgsend video.mp4        # Send a video
 ```
 
-### Contact Selection
-
+**Contact Selection:**
 - **Type** to fuzzy search through contacts
 - **↑↓** to navigate
 - **Enter** to select
 - **Esc** to cancel
 
-### First Run
+### LLM-Friendly Commands (JSON Output)
 
-On first run, you'll be prompted to:
-1. Enter your Telegram API credentials
-2. Authenticate with your phone number
+All commands below output JSON for easy parsing by LLMs and scripts.
+
+#### Configure credentials
+
+```bash
+tgsend config --api-id 12345 --api-hash "your_hash"
+```
+
+#### Check status
+
+```bash
+tgsend status
+# {"success": true, "configured": true, "authenticated": true, "user": {...}}
+```
+
+#### Authenticate
+
+```bash
+# Step 1: Request code
+tgsend auth --phone "+1234567890"
+# {"success": true, "status": "code_sent", "phone_code_hash": "abc123", ...}
+
+# Step 2: Verify code
+tgsend auth --phone "+1234567890" --code 12345
+# {"success": true, "status": "authorized", "user": {...}}
+
+# If 2FA is enabled:
+tgsend auth --phone "+1234567890" --code 12345 --password "your_2fa_password"
+```
+
+#### List/search contacts
+
+```bash
+# List all contacts
+tgsend contacts
+# {"success": true, "count": 50, "contacts": [{"id": 123, "name": "John", "type": "user"}, ...]}
+
+# Search contacts
+tgsend contacts --search "john"
+# {"success": true, "count": 3, "contacts": [{"id": 123, "name": "John Doe", "type": "user", "match_score": 90}, ...]}
+```
+
+#### Send file (non-interactive)
+
+```bash
+# By name (fuzzy matched)
+tgsend send photo.jpg --to "John Doe"
+
+# By Telegram ID
+tgsend send photo.jpg --to-id 123456789
+```
+
+## Session Storage
 
 Your session is saved locally at `~/.telegram_file_sender/`.
 
